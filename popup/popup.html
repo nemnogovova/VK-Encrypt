@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VK Шифратор</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="popup-container">
+    <div class="popup-header">
+      <div class="logo">🔒</div>
+      <h1>VK Шифратор</h1>
+    </div>
+
+    <div class="status-bar" id="statusBar">
+      <span class="status-dot" id="statusDot"></span>
+      <span id="statusText">Не активно</span>
+    </div>
+
+    <div class="section">
+      <label for="encryptionKey">Ключ шифрования</label>
+      <div class="key-input-group">
+        <input type="password" id="encryptionKey" placeholder="Введите общий ключ..." autocomplete="off">
+        <button id="toggleKeyVisibility" class="icon-btn" title="Показать/скрыть ключ">👁</button>
+      </div>
+      <p class="hint">Одинаковый ключ должен быть у обоих собеседников</p>
+    </div>
+
+    <div class="section">
+      <label class="toggle-label">
+        <span>Шифрование активно</span>
+        <input type="checkbox" id="encryptionEnabled">
+        <span class="toggle-slider"></span>
+      </label>
+    </div>
+
+    <div class="section">
+      <button id="saveBtn" class="primary-btn">Сохранить</button>
+    </div>
+
+    <div class="section info">
+      <p>📌 Зашифрованные сообщения помечаются префиксом <code>🔐ENC:</code></p>
+      <p>📌 Без расширения сообщения выглядят как случайный набор символов</p>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
