@@ -1,21 +1,16 @@
 ﻿/**
- * VK Шифратор — Popup Script
+ * VK Шифратор — Popup Script (v2)
+ * Reads state directly from chrome.storage; sends commands to content script.
  */
 
 document.addEventListener('DOMContentLoaded', () => {
 
-  // ── State from content script ──────────────────────────────────────────
-  let state = {
-    chatId:   null,
-    config:   null,
-    allChats: {},
-    onPage:   false
-  };
+  // ── State ──────────────────────────────────────────────────────────────
+  // config is the flat ChatConfig: { state, enabled, fingerprint, … }
+  let state = { chatId: null, config: null, allChats: {}, onPage: false, tabId: null };
 
-  // ── Element refs ──────────────────────────────────────────────────────
-  const el = id => document.getElementById(id);
-
-  const STATES = ['nopage','nochat','none','initiated','received','verifying','active'];
+  const el    = id => document.getElementById(id);
+  const STATES = ['nopage', 'nochat', 'none', 'initiated', 'received', 'verifying', 'active'];
 
   function showState(name) {
     STATES.forEach(s => el('state-' + s)?.classList.add('hidden'));
@@ -32,40 +27,30 @@ document.addEventListener('DOMContentLoaded', () => {
   function renderCurrentChat() {
     const { chatId, config, onPage } = state;
 
-    if (!onPage) { showState('nopage'); return; }
-    if (!chatId)  { showState('nochat'); return; }
+    if (!onPage)  { showState('nopage');  return; }
+    if (!chatId)  { showState('nochat');  return; }
 
-    const hs = config?.handshake;
-    const hsState = hs?.state || 'none';
+    const hsState = config?.state || 'none';
 
-    if (!config || hsState === 'none') {
-      showState('none');
-      return;
-    }
+    if (!config || hsState === 'none') { showState('none'); return; }
 
-    if (hsState === 'initiated') {
-      showState('initiated');
-      return;
-    }
+    if (hsState === 'initiated') { showState('initiated'); return; }
 
-    if (hsState === 'received') {
-      showState('received');
-      return;
-    }
+    if (hsState === 'received')  { showState('received');  return; }
 
     if (hsState === 'verifying') {
       showState('verifying');
-      el('fp-display').textContent = hs.fingerprint || '';
+      el('fp-display').textContent = config.fingerprint || '';
       return;
     }
 
     if (hsState === 'active') {
       showState('active');
-      const on = config.enabled;
-      el('active-dot').className = 'p-status-dot ' + (on ? 'p-status-dot--on' : 'p-status-dot--off');
+      const on = !!config.enabled;
+      el('active-dot').className   = 'p-status-dot ' + (on ? 'p-status-dot--on' : 'p-status-dot--off');
       el('active-title').textContent = on ? 'Шифрование активно' : 'Шифрование выключено';
-      el('chk-enabled').checked = on;
-      el('fp-active').textContent = hs.fingerprint || '';
+      el('chk-enabled').checked    = on;
+      el('fp-active').textContent  = config.fingerprint || '';
       return;
     }
 
@@ -87,103 +72,78 @@ document.addEventListener('DOMContentLoaded', () => {
     empty.classList.add('hidden');
 
     ids.forEach(id => {
-      const c  = chats[id];
-      const hs = c.handshake || {};
+      const c = chats[id];
       const stateLabel = {
         none:      'Нет ключа',
         initiated: 'Ожидание…',
         received:  'Запрос',
         verifying: 'Сверка',
         active:    c.enabled ? '🔒 Активно' : '🔓 Выкл'
-      }[hs.state || 'none'] || '—';
-
-      const dot = c.enabled ? '🟢' : '⚪';
+      }[c.state || 'none'] || '—';
 
       const item = document.createElement('div');
       item.className = 'p-chat-item';
-      item.innerHTML = `
-        <span class="p-chat-id">Чат ${id}</span>
-        <span class="p-chat-state">${stateLabel}</span>
-        <button class="p-chat-del" data-id="${id}" title="Удалить">✕</button>
-      `;
+      item.innerHTML =
+        '<span class="p-chat-id">Чат ' + id + '</span>' +
+        '<span class="p-chat-state">' + stateLabel + '</span>' +
+        '<button class="p-chat-del" data-id="' + id + '" title="Удалить">✕</button>';
       list.appendChild(item);
     });
 
     list.querySelectorAll('.p-chat-del').forEach(btn => {
       btn.addEventListener('click', () => {
         const id = btn.dataset.id;
-        if (!confirm(`Сбросить ключ для чата ${id}?`)) return;
-        sendToContent({ type: 'VKE_RESET_CHAT', chatId: id });
-        delete state.allChats[id];
-        if (state.chatId === id) { state.config = null; }
-        render();
+        if (!confirm('Сбросить ключ для чата ' + id + '?')) return;
+        chrome.storage.local.get(['vkEncChats'], data => {
+          const chats = data.vkEncChats || {};
+          delete chats[id];
+          chrome.storage.local.set({ vkEncChats: chats }, () => {
+            if (state.chatId === id) state.config = null;
+            delete state.allChats[id];
+            sendToContent({ type: 'VKE_RESET_CHAT', chatId: id });
+            render();
+          });
+        });
       });
     });
   }
 
-  // ── Message to content script ─────────────────────────────────────────
+  // ── Content script communication ──────────────────────────────────────
 
   function sendToContent(msg) {
-    chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
-      if (tabs[0]) chrome.tabs.sendMessage(tabs[0].id, msg).catch(() => {});
-    });
+    if (state.tabId) {
+      chrome.tabs.sendMessage(state.tabId, msg).catch(() => {});
+    }
   }
 
   // ── Button handlers ───────────────────────────────────────────────────
 
-  el('btn-hs-start')?.addEventListener('click', () => {
-    sendToContent({ type: 'VKE_HS_START' });
-    // Optimistic UI
-    if (!state.config) state.config = { enabled: false, passphrase: '', handshake: { state: 'none', myPubKey: '', myPrivKey: '', theirPubKey: '', fingerprint: '' } };
-    state.config.handshake.state = 'initiated';
-    render();
-  });
+  el('btn-hs-start')?.addEventListener('click',  () => sendToContent({ type: 'VKE_HS_START' }));
+  el('btn-hs-cancel')?.addEventListener('click', () => sendToContent({ type: 'VKE_HS_CANCEL' }));
+  el('btn-hs-accept')?.addEventListener('click', () => sendToContent({ type: 'VKE_HS_ACCEPT' }));
+  el('btn-hs-decline')?.addEventListener('click',() => sendToContent({ type: 'VKE_HS_DECLINE' }));
 
-  el('btn-hs-cancel')?.addEventListener('click', () => {
-    sendToContent({ type: 'VKE_HS_CANCEL' });
-    if (state.config) state.config.handshake.state = 'none';
-    render();
-  });
-
-  el('btn-hs-accept')?.addEventListener('click', () => {
-    sendToContent({ type: 'VKE_HS_ACCEPT' });
-    if (state.config) state.config.handshake.state = 'verifying';
-    render();
-  });
-
-  el('btn-hs-decline')?.addEventListener('click', () => {
-    sendToContent({ type: 'VKE_HS_CANCEL' });
-    if (state.config) state.config.handshake.state = 'none';
-    render();
-  });
-
-  el('btn-fp-ok')?.addEventListener('click', () => {
-    sendToContent({ type: 'VKE_FP_CONFIRM' });
-    if (state.config) {
-      state.config.handshake.state = 'active';
-      state.config.enabled = true;
-    }
-    render();
-  });
+  el('btn-fp-ok')?.addEventListener('click', () => sendToContent({ type: 'VKE_FP_CONFIRM' }));
 
   el('btn-fp-bad')?.addEventListener('click', () => {
     sendToContent({ type: 'VKE_HS_CANCEL' });
-    if (state.config) state.config.handshake.state = 'none';
-    showToast('⚠️ Ключи сброшены');
-    render();
+    showToast('⚠️ Ключи сброшены — безопасность нарушена');
   });
 
-  el('chk-enabled')?.addEventListener('change', () => {
-    sendToContent({ type: 'VKE_TOGGLE' });
-    if (state.config) state.config.enabled = el('chk-enabled').checked;
-    render();
-  });
+  el('chk-enabled')?.addEventListener('change', () => sendToContent({ type: 'VKE_TOGGLE' }));
 
   el('btn-reset')?.addEventListener('click', () => {
     if (!state.chatId) return;
     if (!confirm('Сбросить ключ шифрования для этого чата?')) return;
     sendToContent({ type: 'VKE_RESET_CHAT', chatId: state.chatId });
-    state.config = null;
+  });
+
+  // ── Storage change listener (real-time UI sync) ───────────────────────
+
+  chrome.storage.onChanged.addListener(changes => {
+    if (!changes.vkEncChats) return;
+    state.allChats = changes.vkEncChats.newValue || {};
+    state.config   = state.chatId ? (state.allChats[state.chatId] || null) : null;
     render();
   });
 
@@ -191,40 +151,47 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function showToast(msg) {
     let t = document.querySelector('.p-toast');
-    if (!t) { t = document.createElement('div'); t.className = 'p-toast'; document.body.appendChild(t); }
+    if (!t) {
+      t = document.createElement('div');
+      t.className = 'p-toast';
+      document.body.appendChild(t);
+      t.style.cssText =
+        'position:fixed;bottom:12px;left:50%;transform:translateX(-50%);' +
+        'background:#333;color:#fff;padding:6px 14px;border-radius:6px;' +
+        'font-size:12px;z-index:9999;transition:opacity .3s;';
+    }
     t.textContent = msg;
-    t.style.cssText = 'position:fixed;bottom:12px;left:50%;transform:translateX(-50%);background:#333;color:#fff;padding:6px 14px;border-radius:6px;font-size:12px;z-index:999;transition:opacity .3s;';
-    setTimeout(() => t.style.opacity = '0', 2000);
-    setTimeout(() => t.remove(), 2400);
+    t.style.opacity = '1';
+    clearTimeout(t._timer);
+    t._timer = setTimeout(() => { t.style.opacity = '0'; }, 2200);
   }
 
-  // ── Listen for state from content script ──────────────────────────────
+  // ── Init: read tab URL + storage ─────────────────────────────────────
 
-  chrome.runtime.onMessage.addListener(msg => {
-    if (msg.type === 'VKE_STATE') {
-      state.chatId   = msg.chatId   || null;
-      state.config   = msg.config   || null;
-      state.allChats = msg.allChats || {};
-      state.onPage   = true;
-      render();
-    }
-  });
+  function extractChatId(url) {
+    let m = url.match(/[?&]sel=([^&#]+)/);
+    if (m) return m[1];
+    m = url.match(/\/im\/convo\/(\d+)/);
+    if (m) return m[1];
+    return null;
+  }
 
-  // ── Init: request current state ───────────────────────────────────────
+  function loadState() {
+    chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
+      const tab = tabs[0];
+      if (!tab) { render(); return; }
 
-  chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
-    if (!tabs[0]) { render(); return; }
-    const url = tabs[0].url || '';
-    state.onPage = url.includes('vk.com/im');
-    chrome.tabs.sendMessage(tabs[0].id, { type: 'VKE_GET_STATE' }, () => {
-      if (chrome.runtime.lastError) {
-        // Content script not loaded (not on VK)
-        state.onPage = false;
+      state.tabId  = tab.id;
+      state.onPage = (tab.url || '').includes('vk.com/im');
+      state.chatId = extractChatId(tab.url || '');
+
+      chrome.storage.local.get(['vkEncChats'], data => {
+        state.allChats = data.vkEncChats || {};
+        state.config   = state.chatId ? (state.allChats[state.chatId] || null) : null;
         render();
-      }
+      });
     });
-  });
+  }
 
-  // Fallback render
-  setTimeout(() => { if (!el('state-active')?.classList.contains('hidden') === false) render(); }, 300);
+  loadState();
 });

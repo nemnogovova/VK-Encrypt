@@ -15,8 +15,9 @@
   transition: background 0.2s;
 }
 
-.vke-panel--on  { border-left: 3px solid #4bb34b; }
-.vke-panel--off { border-left: 3px solid #99a2ad; }
+.vke-panel--on   { border-left: 3px solid #4bb34b; }
+.vke-panel--off  { border-left: 3px solid #99a2ad; }
+.vke-panel--wait { border-left: 3px solid #ffa000; }
 
 /* Row / Col layout */
 .vke-row {
@@ -89,6 +90,34 @@
 .vke-btn--ghost:hover { background: var(--vkui--color_separator_secondary, #e7e8ec); }
 
 .vke-btn--sm { padding: 5px 8px; }
+
+/* ── Toggle switch ───────────────────────────────────────────────────────── */
+.vke-toggle {
+  position: relative;
+  display: inline-flex;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.vke-toggle input { position: absolute; opacity: 0; width: 0; height: 0; }
+.vke-toggle-track {
+  width: 34px; height: 18px;
+  background: #ccc;
+  border-radius: 9px;
+  transition: background 0.2s;
+  position: relative;
+}
+.vke-toggle-track::after {
+  content: '';
+  position: absolute;
+  top: 2px; left: 2px;
+  width: 14px; height: 14px;
+  background: #fff;
+  border-radius: 50%;
+  transition: transform 0.2s;
+  box-shadow: 0 1px 3px rgba(0,0,0,.2);
+}
+.vke-toggle input:checked ~ .vke-toggle-track { background: #4bb34b; }
+.vke-toggle input:checked ~ .vke-toggle-track::after { transform: translateX(16px); }
 
 /* ── Handshake message pill ──────────────────────────────────────────────── */
 .vke-hs-msg {

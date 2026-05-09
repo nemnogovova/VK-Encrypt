@@ -1,673 +1,642 @@
 ﻿/**
- * VK Шифратор — Content Script
- * Per-chat AES-GCM encryption with ECDH handshake support.
- *
- * Storage: chrome.storage.local → vkEncChats: { [chatId]: ChatConfig }
- * ChatConfig: { enabled, passphrase, handshake: { state, myPubKey, myPrivKey, theirPubKey, fingerprint } }
- *
- * Handshake messages sent through VK chat (🔐 becomes <img alt="🔐"> in DOM):
- *   Initiate : 🔐HS:INIT:<pubKeyBase64>
- *   Accept   : 🔐HS:ACPT:<pubKeyBase64>
+ * VK Шифратор — Content Script (v2)
+ * Per-chat ECDH encryption with in-chat panel.
+ * VK converts 🔐 emoji to <img alt="🔐" class="Emoji">, so after the img
+ * the text node contains only the suffix: "ENC:…", "HS-INIT:…", "HS-ACK:…"
  */
 
 (() => {
   'use strict';
 
-  const ENC_EMOJI      = '\u{1F510}';       // 🔐
-  const ENC_TEXT_TAG   = 'ENC:';
-  const HS_TEXT_TAG    = 'HS:';
-  const ENC_FULL_PFX   = ENC_EMOJI + ENC_TEXT_TAG;
-  const HS_FULL_PFX    = ENC_EMOJI + HS_TEXT_TAG;
+  // ── Constants ─────────────────────────────────────────────────────────────
+  const HS_INIT_PREFIX  = 'HS-INIT:';
+  const HS_ACK_PREFIX   = 'HS-ACK:';
+  const ENC_TEXT_PREFIX = 'ENC:';
+  const ENC_EMOJI       = '\u{1F510}';   // 🔐
+  const STORAGE_KEY     = 'vkEncChats';
 
-  // ── State ────────────────────────────────────────────────────────────────
-  let currentChatId  = null;
-  let currentConfig  = null;
-  let allChats       = {};
-  let panelEl        = null;
-  let scanTimer      = null;
-  let isScanning     = false;
-  let lastUrl        = '';
-  let panelObserver  = null;
+  /** Empty / default chat config. */
+  const EMPTY_CFG = () => ({
+    state:       'none',
+    enabled:     false,
+    myPubKey:    '',
+    myPrivKey:   null,
+    theirPubKey: '',
+    passphrase:  '',
+    fingerprint: ''
+  });
 
-  // ── Chat ID ──────────────────────────────────────────────────────────────
+  // ── Runtime state ─────────────────────────────────────────────────────────
+  let currentChatId    = null;  // peer ID from URL
+  let currentChatState = null;  // ChatConfig object
+  let panelEl          = null;  // injected panel DOM node
+  let scanning         = false; // decrypt re-entrancy guard
 
-  function getChatId() {
-    const url   = new URL(location.href);
-    const sel   = url.searchParams.get('sel');
-    const peer  = url.searchParams.get('peer');
-    if (sel)  return sel;
-    if (peer) return peer;
-    const hashMatch = location.hash.match(/[?&](?:sel|peer)=([^&]+)/);
-    if (hashMatch) return hashMatch[1];
+  // ── Storage helpers ───────────────────────────────────────────────────────
+
+  function loadChatState(chatId) {
+    return new Promise(resolve => {
+      chrome.storage.local.get([STORAGE_KEY], data => {
+        const chats = data[STORAGE_KEY] || {};
+        resolve(chats[chatId] ? { ...EMPTY_CFG(), ...chats[chatId] } : EMPTY_CFG());
+      });
+    });
+  }
+
+  function saveChatState(chatId, cfg) {
+    return new Promise(resolve => {
+      chrome.storage.local.get([STORAGE_KEY], data => {
+        const chats = data[STORAGE_KEY] || {};
+        chats[chatId] = cfg;
+        chrome.storage.local.set({ [STORAGE_KEY]: chats }, resolve);
+      });
+    });
+  }
+
+  function deleteChatState(chatId) {
+    return new Promise(resolve => {
+      chrome.storage.local.get([STORAGE_KEY], data => {
+        const chats = data[STORAGE_KEY] || {};
+        delete chats[chatId];
+        chrome.storage.local.set({ [STORAGE_KEY]: chats }, resolve);
+      });
+    });
+  }
+
+  // ── Chat ID extraction ────────────────────────────────────────────────────
+
+  function getCurrentChatId() {
+    const url = location.href;
+    let m = url.match(/[?&]sel=([^&#]+)/);
+    if (m) return m[1];
+    m = url.match(/\/im\/convo\/(\d+)/);
+    if (m) return m[1];
     return null;
   }
 
-  function isOnIMPage() {
-    return location.hostname === 'vk.com' &&
-      (location.pathname === '/im' || location.pathname.startsWith('/im/'));
-  }
+  // ── Panel creation ────────────────────────────────────────────────────────
 
-  // ── Storage ──────────────────────────────────────────────────────────────
-
-  function loadAllChats(cb) {
-    chrome.storage.local.get(['vkEncChats'], d => {
-      allChats = d.vkEncChats || {};
-      cb();
-    });
-  }
-
-  function saveAllChats(cb) {
-    chrome.storage.local.set({ vkEncChats: allChats }, cb);
-  }
-
-  function getConfig(chatId) {
-    return allChats[chatId] || null;
-  }
-
-  function setConfig(chatId, config, cb) {
-    allChats[chatId] = config;
-    saveAllChats(cb || (() => {}));
-  }
-
-  function defaultConfig() {
-    return {
-      enabled: false,
-      passphrase: '',
-      handshake: { state: 'none', myPubKey: '', myPrivKey: '', theirPubKey: '', fingerprint: '' }
-    };
-  }
-
-  // ── Navigation detection ─────────────────────────────────────────────────
-
-  function onUrlChange() {
-    const newId = getChatId();
-    if (newId === currentChatId && location.href === lastUrl) return;
-    lastUrl       = location.href;
-    currentChatId = newId;
-
-    loadAllChats(() => {
-      currentConfig = getConfig(currentChatId);
-      removePanel();
-      if (isOnIMPage() && currentChatId) {
-        schedulePanel();
-        scheduleDecrypt();
-        scheduleScan();
-      } else {
-        if (scanTimer) { clearInterval(scanTimer); scanTimer = null; }
-      }
-      notifyPopup();
-    });
-  }
-
-  function watchNavigation() {
-    const origPush    = history.pushState.bind(history);
-    const origReplace = history.replaceState.bind(history);
-    history.pushState    = (...a) => { origPush(...a);    onUrlChange(); };
-    history.replaceState = (...a) => { origReplace(...a); onUrlChange(); };
-    window.addEventListener('popstate', onUrlChange);
-    setInterval(() => { if (location.href !== lastUrl) onUrlChange(); }, 800);
-  }
-
-  // ── Panel injection ──────────────────────────────────────────────────────
-
-  const HEADER_SELS = [
-    '[class*="ConvoHeader__root"]',
-    '[class*="ChatHeader__root"]',
-    '[class*="MessengerHeader"]',
-    '[class*="im_chat_header"]',
-    '[class*="ImChat__header"]',
-  ];
-  const CONTENT_SELS = [
-    '[class*="LayoutWrapper__content"]',
-    '[class*="MessengerLayout__right"]',
-    '[class*="im-page-in"]',
-    '#page_body',
-  ];
-
-  function schedulePanel() {
-    let n = 0;
-    const try_ = () => {
-      if (n++ > 30) return;
-      if (!tryInjectPanel()) setTimeout(try_, 300);
-    };
-    try_();
-  }
-
-  function tryInjectPanel() {
-    if (!currentChatId || !isOnIMPage()) return false;
-    if (panelEl && document.body.contains(panelEl)) { updatePanel(); return true; }
-
-    buildPanel();
-
-    for (const sel of HEADER_SELS) {
-      const h = document.querySelector(sel);
-      if (h && h.parentNode) {
-        h.parentNode.insertBefore(panelEl, h.nextSibling);
-        watchPanelRemoval();
-        updatePanel();
-        return true;
-      }
-    }
-    for (const sel of CONTENT_SELS) {
-      const c = document.querySelector(sel);
-      if (c) {
-        c.insertBefore(panelEl, c.firstChild);
-        watchPanelRemoval();
-        updatePanel();
-        return true;
-      }
-    }
-    return false;
-  }
-
-  function buildPanel() {
-    if (panelEl) return;
-    panelEl = document.createElement('div');
-    panelEl.id = 'vke-panel';
-  }
-
-  function removePanel() {
-    if (panelObserver) { panelObserver.disconnect(); panelObserver = null; }
-    if (panelEl && panelEl.parentNode) panelEl.parentNode.removeChild(panelEl);
-    panelEl = null;
-  }
-
-  function watchPanelRemoval() {
-    if (panelObserver) panelObserver.disconnect();
-    if (!panelEl || !panelEl.parentNode) return;
-    panelObserver = new MutationObserver(() => {
-      if (!document.body.contains(panelEl)) {
-        panelObserver.disconnect(); panelObserver = null; panelEl = null;
-        setTimeout(schedulePanel, 300);
-      }
-    });
-    panelObserver.observe(panelEl.parentNode, { childList: true });
+  function createPanel() {
+    const el = document.createElement('div');
+    el.id = 'vke-panel';
+    el.innerHTML =
+      '<div class="vke-row">' +
+        '<span id="vke-ico" class="vke-ico">🔓</span>' +
+        '<span id="vke-txt" class="vke-txt">Шифрование не настроено</span>' +
+        '<span id="vke-fp-sm" class="vke-fp-sm" title="Safety Numbers" style="display:none"></span>' +
+        '<div  id="vke-actions" style="display:flex;gap:6px;align-items:center;flex-shrink:0"></div>' +
+      '</div>' +
+      '<div id="vke-fp-row" class="vke-col" style="display:none">' +
+        '<span style="font-size:11px;color:var(--vkui--color_text_secondary,#818c99)">' +
+          'Сверьте эмодзи с собеседником вне ВКонтакте:' +
+        '</span>' +
+        '<span id="vke-fp" class="vke-fp"></span>' +
+      '</div>';
+    return el;
   }
 
   function updatePanel() {
     if (!panelEl) return;
-    const cfg = currentConfig;
-    const hs  = cfg && cfg.handshake;
-    let html  = '';
+    const cs = currentChatState || EMPTY_CFG();
 
-    if (!cfg || !hs || hs.state === 'none') {
-      html = `
-        <div class="vke-row">
-          <span class="vke-ico vke-ico--off">🔓</span>
-          <span class="vke-txt">Шифрование не настроено</span>
-          <button class="vke-btn vke-btn--blue" id="vke-hs">Рукопожатие</button>
-        </div>`;
-    } else if (hs.state === 'initiated') {
-      html = `
-        <div class="vke-row">
-          <span class="vke-ico">🤝</span>
-          <span class="vke-txt">Ожидаем ответа от собеседника…</span>
-          <button class="vke-btn vke-btn--ghost" id="vke-cancel">Отменить</button>
-        </div>`;
-    } else if (hs.state === 'received') {
-      html = `
-        <div class="vke-col">
-          <div class="vke-row">
-            <span class="vke-ico">🤝</span>
-            <span class="vke-txt"><b>Входящий запрос шифрования</b></span>
-          </div>
-          <div class="vke-row vke-row--btns">
-            <button class="vke-btn vke-btn--blue"  id="vke-accept">Принять</button>
-            <button class="vke-btn vke-btn--ghost" id="vke-decline">Отклонить</button>
-          </div>
-        </div>`;
-    } else if (hs.state === 'verifying') {
-      html = `
-        <div class="vke-col">
-          <div class="vke-row">
-            <span class="vke-ico">🔑</span>
-            <span class="vke-txt">Сверьте эмодзи с собеседником <b>вне ВКонтакте</b>:</span>
-          </div>
-          <div class="vke-fp" title="Safety Numbers — должны совпасть у обоих">${hs.fingerprint}</div>
-          <div class="vke-row vke-row--btns">
-            <button class="vke-btn vke-btn--green"  id="vke-confirm">✓ Совпадают</button>
-            <button class="vke-btn vke-btn--red"    id="vke-mismatch">✕ Не совпадают</button>
-          </div>
-        </div>`;
-    } else if (hs.state === 'active') {
-      const on = cfg.enabled;
-      html = `
-        <div class="vke-row">
-          <span class="vke-ico ${on ? 'vke-ico--on' : 'vke-ico--off'}">${on ? '🔒' : '🔓'}</span>
-          <span class="vke-txt ${on ? 'vke-txt--on' : ''}">${on ? 'Шифрование активно' : 'Шифрование выключено'}</span>
-          <span class="vke-fp-sm" title="Safety Numbers: ${hs.fingerprint}">${hs.fingerprint}</span>
-          <button class="vke-btn vke-btn--ghost" id="vke-toggle">${on ? 'Выкл' : 'Вкл'}</button>
-          <button class="vke-btn vke-btn--ghost vke-btn--sm" id="vke-reset" title="Сбросить ключ">↺</button>
-        </div>`;
+    const ico     = panelEl.querySelector('#vke-ico');
+    const txt     = panelEl.querySelector('#vke-txt');
+    const fpSm    = panelEl.querySelector('#vke-fp-sm');
+    const actions = panelEl.querySelector('#vke-actions');
+    const fpRow   = panelEl.querySelector('#vke-fp-row');
+    const fp      = panelEl.querySelector('#vke-fp');
+
+    panelEl.className = '';
+    panelEl.id = 'vke-panel';
+    fpRow.style.display = 'none';
+    fpSm.style.display  = 'none';
+    actions.innerHTML   = '';
+
+    function mkBtn(label, cls, handler) {
+      const b = document.createElement('button');
+      b.className = 'vke-btn ' + cls;
+      b.innerHTML = label;
+      b.addEventListener('click', handler);
+      return b;
     }
 
-    panelEl.innerHTML = html;
-    panelEl.className = 'vke-panel' + (cfg && cfg.enabled ? ' vke-panel--on' : ' vke-panel--off');
+    switch (cs.state) {
+      case 'none':
+        panelEl.classList.add('vke-panel--off');
+        ico.textContent = '🔓';
+        txt.textContent = 'Шифрование не настроено';
+        actions.appendChild(mkBtn('🤝 Рукопожатие', 'vke-btn--blue', doStartHandshake));
+        break;
 
-    const $ = id => panelEl.querySelector('#' + id);
-    $('vke-hs')?.addEventListener('click',      startHandshake);
-    $('vke-cancel')?.addEventListener('click',  cancelHandshake);
-    $('vke-accept')?.addEventListener('click',  acceptHandshake);
-    $('vke-decline')?.addEventListener('click', declineHandshake);
-    $('vke-confirm')?.addEventListener('click', confirmFingerprint);
-    $('vke-mismatch')?.addEventListener('click',mismatchFingerprint);
-    $('vke-toggle')?.addEventListener('click',  toggleEncryption);
-    $('vke-reset')?.addEventListener('click',   resetChat);
+      case 'initiated':
+        panelEl.classList.add('vke-panel--wait');
+        ico.textContent = '⏳';
+        txt.textContent = 'Ожидание ответа…';
+        actions.appendChild(mkBtn('Отменить', 'vke-btn--ghost', doCancelHandshake));
+        break;
+
+      case 'received':
+        panelEl.classList.add('vke-panel--wait');
+        ico.textContent = '🔑';
+        txt.textContent = 'Входящий запрос шифрования';
+        actions.appendChild(mkBtn('✓ Принять',   'vke-btn--blue',  doAcceptHandshake));
+        actions.appendChild(mkBtn('✕ Отклонить', 'vke-btn--ghost', doCancelHandshake));
+        break;
+
+      case 'verifying':
+        panelEl.classList.add('vke-panel--wait');
+        ico.textContent = '🔑';
+        txt.textContent = 'Сверьте эмодзи:';
+        fpRow.style.display = '';
+        fp.textContent = cs.fingerprint || '';
+        actions.appendChild(mkBtn('✓ Совпадают',    'vke-btn--green', doConfirmFingerprint));
+        actions.appendChild(mkBtn('✕ Не совпадают', 'vke-btn--red',   doCancelHandshake));
+        break;
+
+      case 'active': {
+        const on = cs.enabled;
+        panelEl.classList.add(on ? 'vke-panel--on' : 'vke-panel--off');
+        ico.textContent = on ? '🔒' : '🔓';
+        txt.textContent = on ? 'Шифрование активно' : 'Шифрование выключено';
+        if (cs.fingerprint) {
+          fpSm.style.display = '';
+          fpSm.textContent   = cs.fingerprint;
+        }
+        const tog = document.createElement('label');
+        tog.className = 'vke-toggle';
+        tog.innerHTML = '<input type="checkbox"' + (on ? ' checked' : '') + '>' +
+                        '<span class="vke-toggle-track"></span>';
+        tog.querySelector('input').addEventListener('change', doToggle);
+        actions.appendChild(tog);
+        actions.appendChild(mkBtn('↺', 'vke-btn--ghost vke-btn--sm', doReset));
+        break;
+      }
+    }
   }
 
-  // ── Handshake logic ──────────────────────────────────────────────────────
+  /** Inject / re-inject the panel right after ConvoHeader. */
+  function ensurePanel() {
+    if (!currentChatId) {
+      if (panelEl && panelEl.parentNode) panelEl.remove();
+      panelEl = null;
+      return;
+    }
+    const header = document.querySelector('.ConvoHeader');
+    if (!header) return;
+    if (!panelEl) panelEl = createPanel();
+    if (header.nextSibling !== panelEl) {
+      header.insertAdjacentElement('afterend', panelEl);
+    }
+    updatePanel();
+  }
 
-  async function startHandshake() {
+  // ── Handshake actions ─────────────────────────────────────────────────────
+
+  async function doStartHandshake() {
     if (!currentChatId) return;
-    const kp  = await VKCrypto.generateECDHKeyPair();
-    const cfg = currentConfig || defaultConfig();
-    cfg.handshake  = { state: 'initiated', myPubKey: kp.publicKey, myPrivKey: kp.privateKey, theirPubKey: '', fingerprint: '' };
-    cfg.enabled    = false;
-    cfg.passphrase = '';
-    currentConfig  = cfg;
-    setConfig(currentChatId, cfg);
-    updatePanel();
-    sendMessage(VKCrypto.buildHandshakeMessage('INIT', kp.publicKey));
+    try {
+      const kp      = await VKCrypto.generateECDHKeyPair();
+      const pubB64  = await VKCrypto.exportPublicKeyB64(kp.publicKey);
+      const privJWK = await VKCrypto.exportPrivateKeyJWK(kp.privateKey);
+
+      currentChatState = { ...EMPTY_CFG(), state: 'initiated', myPubKey: pubB64, myPrivKey: privJWK };
+      await saveChatState(currentChatId, currentChatState);
+      updatePanel();
+      sendTextToChat(ENC_EMOJI + HS_INIT_PREFIX + pubB64);
+    } catch (e) {
+      console.error('[VK Enc] doStartHandshake:', e);
+      showToast('Ошибка запуска рукопожатия');
+    }
   }
 
-  function cancelHandshake() {
+  async function doAcceptHandshake() {
+    if (!currentChatId || !currentChatState?.theirPubKey) return;
+    try {
+      const kp          = await VKCrypto.generateECDHKeyPair();
+      const pubB64      = await VKCrypto.exportPublicKeyB64(kp.publicKey);
+      const privJWK     = await VKCrypto.exportPrivateKeyJWK(kp.privateKey);
+      const passphrase  = await VKCrypto.computePassphrase(kp.privateKey, currentChatState.theirPubKey);
+      const fingerprint = await VKCrypto.fingerprintEmojis(pubB64, currentChatState.theirPubKey);
+
+      currentChatState = { ...currentChatState, state: 'verifying', myPubKey: pubB64, myPrivKey: privJWK, passphrase, fingerprint };
+      await saveChatState(currentChatId, currentChatState);
+      updatePanel();
+      sendTextToChat(ENC_EMOJI + HS_ACK_PREFIX + pubB64);
+    } catch (e) {
+      console.error('[VK Enc] doAcceptHandshake:', e);
+      showToast('Ошибка принятия рукопожатия');
+    }
+  }
+
+  async function doCancelHandshake() {
     if (!currentChatId) return;
-    const cfg = currentConfig || defaultConfig();
-    cfg.handshake  = defaultConfig().handshake;
-    cfg.passphrase = '';
-    cfg.enabled    = false;
-    currentConfig  = cfg;
-    setConfig(currentChatId, cfg);
+    currentChatState = EMPTY_CFG();
+    await saveChatState(currentChatId, currentChatState);
     updatePanel();
+    clearDecryptedMarks();
   }
 
-  async function acceptHandshake() {
-    if (!currentChatId || !currentConfig) return;
-    const hs = currentConfig.handshake;
-    if (hs.state !== 'received' || !hs.theirPubKey) return;
-    const kp          = await VKCrypto.generateECDHKeyPair();
-    const passphrase  = await VKCrypto.deriveSharedPassphrase(kp.privateKey, hs.theirPubKey);
-    const fingerprint = await VKCrypto.computeFingerprint(kp.publicKey, hs.theirPubKey);
-    currentConfig.handshake  = { state: 'verifying', myPubKey: kp.publicKey, myPrivKey: kp.privateKey, theirPubKey: hs.theirPubKey, fingerprint };
-    currentConfig.passphrase = passphrase;
-    currentConfig.enabled    = false;
-    setConfig(currentChatId, currentConfig);
+  async function doConfirmFingerprint() {
+    if (!currentChatId) return;
+    currentChatState = { ...currentChatState, state: 'active', enabled: true };
+    await saveChatState(currentChatId, currentChatState);
     updatePanel();
-    sendMessage(VKCrypto.buildHandshakeMessage('ACPT', kp.publicKey));
-  }
-
-  function declineHandshake() { cancelHandshake(); }
-
-  function confirmFingerprint() {
-    if (!currentChatId || !currentConfig) return;
-    if (currentConfig.handshake.state !== 'verifying') return;
-    currentConfig.handshake.state = 'active';
-    currentConfig.enabled = true;
-    setConfig(currentChatId, currentConfig);
-    updatePanel();
-    scheduleScan();
     scheduleDecrypt();
-    notifyPopup();
   }
 
-  function mismatchFingerprint() {
-    cancelHandshake();
-    showToast('⚠️ Ключи не совпали — возможна атака подмены. Соединение сброшено.');
-  }
-
-  function toggleEncryption() {
-    if (!currentChatId || !currentConfig) return;
-    currentConfig.enabled = !currentConfig.enabled;
-    setConfig(currentChatId, currentConfig);
+  async function doToggle() {
+    if (!currentChatId) return;
+    currentChatState = { ...currentChatState, enabled: !currentChatState.enabled };
+    await saveChatState(currentChatId, currentChatState);
     updatePanel();
-    scheduleScan();
-    scheduleDecrypt();
-    notifyPopup();
   }
 
-  function resetChat() {
+  async function doReset() {
     if (!currentChatId) return;
     if (!confirm('Сбросить ключ шифрования для этого чата?')) return;
-    cancelHandshake();
+    await deleteChatState(currentChatId);
+    currentChatState = EMPTY_CFG();
+    updatePanel();
+    clearDecryptedMarks();
   }
 
-  // Scan DOM for incoming handshake messages
-  async function checkForHandshakeMessages() {
-    const containers = document.querySelectorAll('.MessageText, .MessagePreview');
-    for (const c of containers) {
-      if (c.dataset.vkHsProcessed) continue;
-      const hs = extractHsFromContainer(c);
-      if (!hs) continue;
-      c.dataset.vkHsProcessed = '1';
-      await handleIncomingHandshake(hs.type, hs.pubKey, c);
+  // ── VK input interaction ──────────────────────────────────────────────────
+
+  function findInput() {
+    const selectors = [
+      'span.ComposerInput__input',
+      'span.ConvoComposer__input',
+      '[contenteditable="true"][role="textbox"]',
+      '[contenteditable="true"]'
+    ];
+    for (const s of selectors) {
+      const el = document.querySelector(s);
+      if (el) return el;
     }
+    return null;
   }
 
-  function extractHsFromContainer(container) {
-    for (let i = 0; i < container.childNodes.length; i++) {
-      const node = container.childNodes[i];
-      if (node.nodeType === Node.ELEMENT_NODE && node.tagName === 'IMG' &&
-          node.alt && node.alt.includes(ENC_EMOJI)) {
-        const next = container.childNodes[i + 1];
-        if (next && next.nodeType === Node.TEXT_NODE) {
-          const txt = next.textContent.trimStart();
-          if (txt.startsWith(HS_TEXT_TAG)) {
-            const body  = txt.slice(HS_TEXT_TAG.length);
-            const colon = body.indexOf(':');
-            if (colon >= 0) return { type: body.slice(0, colon), pubKey: body.slice(colon + 1).trim() };
+  function setInputText(input, text) {
+    input.focus();
+    document.execCommand('selectAll', false);
+    document.execCommand('insertText', false, text);
+    input.dispatchEvent(new InputEvent('input', { bubbles: true, data: text, inputType: 'insertText' }));
+  }
+
+  function simulateEnter(input) {
+    ['keydown', 'keypress', 'keyup'].forEach(type => {
+      input.dispatchEvent(new KeyboardEvent(type, {
+        key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+        bubbles: true, cancelable: true
+      }));
+    });
+  }
+
+  function sendTextToChat(text) {
+    const input = findInput();
+    if (!input) { console.warn('[VK Enc] No input element found'); return; }
+    input.focus();
+    setInputText(input, text);
+    setTimeout(() => simulateEnter(input), 80);
+  }
+
+  // ── Handshake message detection ───────────────────────────────────────────
+
+  async function scanForHandshakeMessages() {
+    if (!currentChatId) return;
+    const cs = currentChatState;
+    if (!cs) return;
+
+    // Only scan non-outgoing stacks (incoming messages)
+    const stacks = document.querySelectorAll('.ConvoStack:not(.ConvoStack--out)');
+
+    for (const stack of stacks) {
+      const containers = stack.querySelectorAll('.MessageText, .MessagePreview');
+      for (const container of containers) {
+        if (container.dataset.vkeHsProcessed) continue;
+
+        const result = extractHsContent(container);
+        if (!result) continue;
+
+        container.dataset.vkeHsProcessed = '1';
+
+        if (result.type === 'hs-init' && (cs.state === 'none' || cs.state === 'active')) {
+          currentChatState = { ...EMPTY_CFG(), state: 'received', theirPubKey: result.pubKey };
+          await saveChatState(currentChatId, currentChatState);
+          updatePanel();
+          showToast('🔑 Входящий запрос шифрования');
+
+        } else if (result.type === 'hs-ack' && cs.state === 'initiated') {
+          try {
+            const privKey     = await VKCrypto.importPrivateKeyJWK(cs.myPrivKey);
+            const passphrase  = await VKCrypto.computePassphrase(privKey, result.pubKey);
+            const fingerprint = await VKCrypto.fingerprintEmojis(cs.myPubKey, result.pubKey);
+
+            currentChatState = { ...cs, state: 'verifying', theirPubKey: result.pubKey, passphrase, fingerprint };
+            await saveChatState(currentChatId, currentChatState);
+            updatePanel();
+            showToast('🔑 Сверьте эмодзи с собеседником');
+          } catch (e) {
+            console.error('[VK Enc] HS-ACK processing error:', e);
           }
         }
       }
-      if (node.nodeType === Node.TEXT_NODE && node.textContent.includes(HS_FULL_PFX)) {
-        const parsed = VKCrypto.parseHandshake(node.textContent.trim());
-        if (parsed) return parsed;
-      }
-    }
-    return null;
-  }
-
-  async function handleIncomingHandshake(type, theirPubKey, container) {
-    if (!currentChatId) return;
-    renderHsMessage(container, type);
-    const cfg = currentConfig || defaultConfig();
-    const hs  = cfg.handshake;
-
-    if (type === 'INIT') {
-      if (hs.state === 'none') {
-        cfg.handshake = { state: 'received', myPubKey: '', myPrivKey: '', theirPubKey, fingerprint: '' };
-        cfg.passphrase = ''; cfg.enabled = false;
-        currentConfig  = cfg;
-        setConfig(currentChatId, cfg);
-        updatePanel();
-      }
-    } else if (type === 'ACPT') {
-      if (hs.state !== 'initiated') return;
-      const passphrase  = await VKCrypto.deriveSharedPassphrase(hs.myPrivKey, theirPubKey);
-      const fingerprint = await VKCrypto.computeFingerprint(hs.myPubKey, theirPubKey);
-      cfg.handshake = { state: 'verifying', myPubKey: hs.myPubKey, myPrivKey: hs.myPrivKey, theirPubKey, fingerprint };
-      cfg.passphrase = passphrase; cfg.enabled = false;
-      currentConfig = cfg;
-      setConfig(currentChatId, cfg);
-      updatePanel();
     }
   }
 
-  function renderHsMessage(container, type) {
-    const isInit = type === 'INIT';
-    const wrap   = document.createElement('span');
-    wrap.className = 'vke-hs-msg';
-    wrap.innerHTML =
-      `<span class="vke-hs-ico">${isInit ? '🤝' : '✅'}</span>` +
-      `<span class="vke-hs-lbl">${isInit ? 'Запрос шифрования' : 'Ключи переданы'}</span>`;
-    container.textContent = '';
-    container.appendChild(wrap);
-  }
+  function extractHsContent(container) {
+    const nodes = container.childNodes;
+    for (let i = 0; i < nodes.length; i++) {
+      const node = nodes[i];
 
-  // ── Message sending ──────────────────────────────────────────────────────
-
-  function findInput() {
-    const sels = [
-      'span.ComposerInput__input','span.ConvoComposer__input',
-      '[contenteditable="true"][role="textbox"]','.im_editable',
-      '[contenteditable="true"][class*="im-chat-input"]',
-      '.im-page [contenteditable="true"]',
-    ];
-    for (const s of sels) { const el = document.querySelector(s); if (el) return el; }
-    return null;
-  }
-
-  function getInputText(el) {
-    return (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') ? el.value : (el.innerText || el.textContent);
-  }
-
-  function setInputText(el, text) {
-    if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
-      const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
-      setter.call(el, text);
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-    } else {
-      el.focus();
-      const sel = window.getSelection(), r = document.createRange();
-      r.selectNodeContents(el); sel.removeAllRanges(); sel.addRange(r);
-      document.execCommand('insertText', false, text);
-      el.dispatchEvent(new InputEvent('input', { bubbles: true, data: text, inputType: 'insertText' }));
-    }
-  }
-
-  function simulateEnter(el) {
-    ['keydown','keypress','keyup'].forEach(t =>
-      el.dispatchEvent(new KeyboardEvent(t, { key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true,cancelable:true }))
-    );
-  }
-
-  function sendMessage(text) {
-    const el = findInput();
-    if (!el) return;
-    setInputText(el, text);
-    setTimeout(() => simulateEnter(el), 80);
-  }
-
-  // ── Send interceptor ─────────────────────────────────────────────────────
-
-  function isFocused(el) {
-    return document.activeElement === el || el.contains(document.activeElement);
-  }
-
-  function setupSendInterceptor() {
-    document.addEventListener('keydown', async e => {
-      if (!currentConfig?.enabled || !currentConfig?.passphrase) return;
-      if (e.key !== 'Enter' || e.shiftKey) return;
-      const el = findInput();
-      if (!el || !isFocused(el)) return;
-      const text = getInputText(el);
-      if (!text?.trim() || text.trim().startsWith(ENC_FULL_PFX) || text.trim().startsWith(HS_FULL_PFX)) return;
-      e.preventDefault(); e.stopImmediatePropagation(); e.stopPropagation();
-      try {
-        const enc = await VKCrypto.encrypt(text.trim(), currentConfig.passphrase);
-        setInputText(el, enc);
-        await new Promise(r => setTimeout(r, 100));
-        simulateEnter(el);
-        postSendScans();
-      } catch (err) { console.error('[VKE] encrypt error', err); }
-    }, true);
-
-    document.addEventListener('click', async e => {
-      if (!currentConfig?.enabled || !currentConfig?.passphrase) return;
-      const btn = e.target.closest(
-        '[class*="ConvoComposer__sendButton"],[class*="ConvoComposer__buttonIcon--submit"],' +
-        '[class*="im-send-btn"],[data-testid="msg_send_button"],[class*="SendButton"]'
-      );
-      if (!btn) return;
-      const el = findInput();
-      if (!el) return;
-      const text = getInputText(el);
-      if (!text?.trim() || text.trim().startsWith(ENC_FULL_PFX) || text.trim().startsWith(HS_FULL_PFX)) return;
-      e.preventDefault(); e.stopImmediatePropagation(); e.stopPropagation();
-      try {
-        const enc = await VKCrypto.encrypt(text.trim(), currentConfig.passphrase);
-        setInputText(el, enc);
-        await new Promise(r => setTimeout(r, 100));
-        btn.click();
-        postSendScans();
-      } catch (err) { console.error('[VKE] encrypt error', err); }
-    }, true);
-  }
-
-  function postSendScans() {
-    [400, 1200, 3000].forEach(t => setTimeout(decryptAllMessages, t));
-  }
-
-  // ── Decryption ───────────────────────────────────────────────────────────
-
-  function scheduleDecrypt() { setTimeout(decryptAllMessages, 300); }
-
-  function scheduleScan() {
-    if (scanTimer) clearInterval(scanTimer);
-    scanTimer = setInterval(() => {
-      decryptAllMessages();
-      checkForHandshakeMessages();
-    }, 2000);
-  }
-
-  async function decryptAllMessages() {
-    if (!currentConfig?.enabled || !currentConfig?.passphrase) {
-      checkForHandshakeMessages();
-      return;
-    }
-    if (isScanning) return;
-    isScanning = true;
-    try {
-      for (const c of document.querySelectorAll('.MessageText, .MessagePreview')) {
-        if (c.closest('.vke-dec') || c.closest('.vke-locked') || c.dataset.vkEncProcessed) continue;
-        await tryDecrypt(c);
-      }
-      checkForHandshakeMessages();
-    } finally { isScanning = false; }
-  }
-
-  async function tryDecrypt(container) {
-    let encNode = null;
-    for (let i = 0; i < container.childNodes.length; i++) {
-      const n = container.childNodes[i];
-      if (n.nodeType === Node.ELEMENT_NODE && n.tagName === 'IMG' && n.alt?.includes(ENC_EMOJI)) {
-        const nxt = container.childNodes[i + 1];
-        if (nxt?.nodeType === Node.TEXT_NODE && nxt.textContent.trimStart().startsWith(ENC_TEXT_TAG)) {
-          encNode = nxt; break;
+      // Pattern: <img alt="🔐"> followed by a text node "HS-INIT:..." or "HS-ACK:..."
+      if (node.nodeType === Node.ELEMENT_NODE &&
+          node.tagName === 'IMG' &&
+          node.alt && node.alt.includes(ENC_EMOJI)) {
+        const next = nodes[i + 1];
+        if (next && next.nodeType === Node.TEXT_NODE) {
+          const txt = next.textContent.trimStart();
+          if (txt.startsWith(HS_INIT_PREFIX))
+            return { type: 'hs-init', pubKey: txt.slice(HS_INIT_PREFIX.length).trim() };
+          if (txt.startsWith(HS_ACK_PREFIX))
+            return { type: 'hs-ack', pubKey: txt.slice(HS_ACK_PREFIX.length).trim() };
         }
       }
-      if (n.nodeType === Node.TEXT_NODE && n.textContent.includes(ENC_FULL_PFX)) { encNode = n; break; }
-    }
-    if (!encNode) return;
 
-    const raw = encNode.textContent.trimStart();
-    let payload;
-    if (raw.startsWith(ENC_TEXT_TAG)) {
-      const m = raw.slice(ENC_TEXT_TAG.length).match(/^[A-Za-z0-9+/=]+/);
-      if (!m) return;
-      payload = ENC_FULL_PFX + m[0];
-    } else {
-      const idx = raw.indexOf(ENC_FULL_PFX);
-      const m   = idx >= 0 ? raw.slice(idx + ENC_FULL_PFX.length).match(/^[A-Za-z0-9+/=]+/) : null;
-      if (!m) return;
-      payload = ENC_FULL_PFX + m[0];
+      // Fallback: plain text node with full prefix (emoji not converted to img)
+      if (node.nodeType === Node.TEXT_NODE) {
+        const txt = node.textContent;
+        const ii = txt.indexOf(ENC_EMOJI + HS_INIT_PREFIX);
+        if (ii >= 0)
+          return { type: 'hs-init', pubKey: txt.slice(ii + ENC_EMOJI.length + HS_INIT_PREFIX.length).trim() };
+        const ai = txt.indexOf(ENC_EMOJI + HS_ACK_PREFIX);
+        if (ai >= 0)
+          return { type: 'hs-ack', pubKey: txt.slice(ai + ENC_EMOJI.length + HS_ACK_PREFIX.length).trim() };
+      }
+    }
+    return null;
+  }
+
+  // ── Decryption ────────────────────────────────────────────────────────────
+
+  async function decryptAllMessages() {
+    if (!currentChatState?.passphrase) return;
+    if (scanning) return;
+    scanning = true;
+    try {
+      const containers = document.querySelectorAll('.MessageText, .MessagePreview');
+      for (const c of containers) {
+        if (c.dataset.vkEncDone) continue;
+        await tryDecryptContainer(c);
+      }
+    } finally {
+      scanning = false;
+    }
+  }
+
+  async function tryDecryptContainer(container) {
+    let encPayload = null;
+    const nodes = container.childNodes;
+
+    for (let i = 0; i < nodes.length; i++) {
+      const node = nodes[i];
+
+      if (node.nodeType === Node.ELEMENT_NODE &&
+          node.tagName === 'IMG' &&
+          node.alt && node.alt.includes(ENC_EMOJI)) {
+        const next = nodes[i + 1];
+        if (next && next.nodeType === Node.TEXT_NODE) {
+          const txt = next.textContent.trimStart();
+          if (txt.startsWith(ENC_TEXT_PREFIX)) {
+            encPayload = ENC_EMOJI + txt;
+            break;
+          }
+        }
+        continue;
+      }
+
+      if (node.nodeType === Node.TEXT_NODE) {
+        const txt = node.textContent;
+        const idx = txt.indexOf(ENC_EMOJI + ENC_TEXT_PREFIX);
+        if (idx >= 0) { encPayload = txt.slice(idx); break; }
+      }
     }
 
-    const plaintext = await VKCrypto.decrypt(payload, currentConfig.passphrase);
-    container.dataset.vkEncProcessed = '1';
+    if (!encPayload) return;
+    container.dataset.vkEncDone = '1';
+
+    const plaintext = await VKCrypto.decrypt(encPayload, currentChatState.passphrase);
 
     if (plaintext !== null) {
       const wrap = document.createElement('span');
       wrap.className = 'vke-dec';
-      const t = document.createElement('span');
-      t.textContent = plaintext;
-      const b = document.createElement('span');
-      b.className = 'vke-badge vke-badge--ok';
-      b.title = 'Расшифровано · VK Шифратор';
-      b.textContent = '🔓';
-      wrap.append(t, b);
-      container.textContent = '';
+
+      const textSpan = document.createElement('span');
+      textSpan.textContent = plaintext;
+
+      const badge = document.createElement('span');
+      badge.className = 'vke-badge vke-badge--ok';
+      badge.textContent = ' \u{1F513}'; // 🔓
+      badge.title = 'Расшифровано VK Шифратором';
+
+      wrap.appendChild(textSpan);
+      wrap.appendChild(badge);
+      container.innerHTML = '';
       container.appendChild(wrap);
     } else {
-      const b = document.createElement('span');
-      b.className = 'vke-badge vke-badge--locked';
-      b.title = 'Зашифровано — нет ключа для этого чата';
-      b.textContent = '🔐';
-      container.appendChild(b);
-      container.classList.add('vke-locked');
+      if (!container.querySelector('.vke-badge--locked')) {
+        const badge = document.createElement('span');
+        badge.className = 'vke-badge vke-badge--locked';
+        badge.textContent = ' \u{1F510}'; // 🔐
+        badge.title = 'Зашифровано — неверный или отсутствующий ключ';
+        container.appendChild(badge);
+        container.classList.add('vke-locked');
+      }
     }
   }
 
-  // ── MutationObserver ─────────────────────────────────────────────────────
-
-  function setupMutationObserver() {
-    let deb = null;
-    const obs = new MutationObserver(mutations => {
-      let needsScan = false;
-      for (const m of mutations) {
-        for (const n of m.addedNodes) {
-          if (needsScan) break;
-          const txt = n.nodeType === Node.TEXT_NODE
-            ? n.textContent
-            : (n.innerText || n.textContent || '');
-          if (txt.includes(ENC_TEXT_TAG) || txt.includes(HS_TEXT_TAG) ||
-              n.querySelector?.('.MessageText, .MessagePreview')) {
-            needsScan = true;
-          }
-        }
-        if (needsScan) break;
-      }
-      if (needsScan) {
-        clearTimeout(deb);
-        deb = setTimeout(() => { decryptAllMessages(); checkForHandshakeMessages(); }, 150);
-      }
-    });
-    obs.observe(document.body, { childList: true, subtree: true, characterData: true });
+  function clearDecryptedMarks() {
+    document.querySelectorAll('[data-vk-enc-done]').forEach(el => delete el.dataset.vkEncDone);
+    document.querySelectorAll('[data-vke-hs-processed]').forEach(el => delete el.dataset.vkeHsProcessed);
+    document.querySelectorAll('.vke-dec').forEach(el => el.parentNode?.removeChild(el));
+    document.querySelectorAll('.vke-badge').forEach(el => el.parentNode?.removeChild(el));
+    document.querySelectorAll('.vke-locked').forEach(el => el.classList.remove('vke-locked'));
   }
 
-  // ── Toast ─────────────────────────────────────────────────────────────────
+  // ── Outgoing message interception ─────────────────────────────────────────
 
-  function showToast(msg) {
-    const t = document.createElement('div');
-    t.className = 'vke-toast';
-    t.textContent = msg;
-    document.body.appendChild(t);
-    setTimeout(() => t.classList.add('vke-toast--show'), 10);
-    setTimeout(() => { t.classList.remove('vke-toast--show'); setTimeout(() => t.remove(), 400); }, 4500);
+  function setupSendInterceptor() {
+    document.addEventListener('keydown', async e => {
+      if (e.key !== 'Enter' || e.shiftKey || e.ctrlKey || e.altKey) return;
+      if (!shouldEncrypt()) return;
+      const input = findInput();
+      if (!input || !isInputActive(input)) return;
+      const text = (input.innerText || input.textContent || '').trim();
+      if (!text || text.startsWith(ENC_EMOJI)) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      await encryptAndSend(input, text, 'enter');
+    }, true);
+
+    document.addEventListener('click', async e => {
+      if (!shouldEncrypt()) return;
+      const sendBtn = e.target.closest(
+        '[class*="ConvoComposer__sendButton"],[class*="sendButton"],[class*="SendButton"]'
+      );
+      if (!sendBtn) return;
+      const input = findInput();
+      if (!input) return;
+      const text = (input.innerText || input.textContent || '').trim();
+      if (!text || text.startsWith(ENC_EMOJI)) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      await encryptAndSend(input, text, sendBtn);
+    }, true);
+  }
+
+  function shouldEncrypt() {
+    return !!(currentChatState?.enabled && currentChatState?.passphrase);
+  }
+
+  function isInputActive(input) {
+    return document.activeElement === input || input.contains(document.activeElement);
+  }
+
+  async function encryptAndSend(input, text, trigger) {
+    try {
+      const encrypted = await VKCrypto.encrypt(text, currentChatState.passphrase);
+      setInputText(input, encrypted);
+      await new Promise(r => setTimeout(r, 80));
+      if (trigger === 'enter') simulateEnter(input);
+      else trigger.click(); // sendBtn
+      scheduleDecrypt();
+    } catch (e) {
+      console.error('[VK Enc] Encryption error:', e);
+    }
+  }
+
+  function scheduleDecrypt() {
+    setTimeout(() => { decryptAllMessages(); scanForHandshakeMessages(); }, 500);
+    setTimeout(decryptAllMessages, 1500);
+  }
+
+  // ── URL / chat navigation ─────────────────────────────────────────────────
+
+  async function onChatChange() {
+    const newId = getCurrentChatId();
+    if (newId === currentChatId) return;
+    currentChatId    = newId;
+    currentChatState = null;
+    clearDecryptedMarks();
+    if (newId) currentChatState = await loadChatState(newId);
+    ensurePanel();
+    if (currentChatState?.passphrase) scheduleDecrypt();
+    scanForHandshakeMessages();
+  }
+
+  function startURLWatcher() {
+    let lastURL = location.href;
+    setInterval(() => {
+      if (location.href !== lastURL) { lastURL = location.href; onChatChange(); }
+    }, 400);
+    const origPush = history.pushState.bind(history);
+    history.pushState = function (...args) { origPush(...args); setTimeout(onChatChange, 60); };
+    window.addEventListener('popstate', () => setTimeout(onChatChange, 60));
+  }
+
+  // ── MutationObserver ──────────────────────────────────────────────────────
+
+  function setupMutationObserver() {
+    let decryptTimer = null;
+    let panelTimer   = null;
+
+    const observer = new MutationObserver(mutations => {
+      let needsDecrypt = false;
+      let needsPanel   = false;
+
+      for (const m of mutations) {
+        for (const node of m.addedNodes) {
+          if (node.nodeType !== Node.ELEMENT_NODE) continue;
+          if (node.classList?.contains('ConvoHeader') || node.querySelector?.('.ConvoHeader'))
+            needsPanel = true;
+          const text = node.innerText || node.textContent || '';
+          if (text.includes(ENC_TEXT_PREFIX) || text.includes(HS_INIT_PREFIX) || text.includes(HS_ACK_PREFIX))
+            needsDecrypt = true;
+          if (node.querySelector?.('.MessageText, .MessagePreview'))
+            needsDecrypt = true;
+        }
+      }
+
+      if (needsPanel)   { clearTimeout(panelTimer);   panelTimer   = setTimeout(ensurePanel, 350); }
+      if (needsDecrypt) { clearTimeout(decryptTimer); decryptTimer = setTimeout(() => { decryptAllMessages(); scanForHandshakeMessages(); }, 200); }
+    });
+
+    observer.observe(document.body, { childList: true, subtree: true });
   }
 
   // ── Popup communication ───────────────────────────────────────────────────
 
-  function notifyPopup() {
-    chrome.runtime.sendMessage({ type: 'VKE_STATE', chatId: currentChatId, config: currentConfig, allChats }).catch(() => {});
-  }
-
-  chrome.runtime.onMessage.addListener(msg => {
-    if (msg.type === 'VKE_GET_STATE')   notifyPopup();
-    if (msg.type === 'VKE_HS_START')    startHandshake();
-    if (msg.type === 'VKE_HS_CANCEL')   cancelHandshake();
-    if (msg.type === 'VKE_HS_ACCEPT')   acceptHandshake();
-    if (msg.type === 'VKE_FP_CONFIRM')  confirmFingerprint();
-    if (msg.type === 'VKE_TOGGLE' && currentChatId && currentConfig) {
-      currentConfig.enabled = !currentConfig.enabled;
-      setConfig(currentChatId, currentConfig);
-      updatePanel(); scheduleScan(); notifyPopup();
-    }
-    if (msg.type === 'VKE_RESET_CHAT' && msg.chatId) {
-      delete allChats[msg.chatId];
-      saveAllChats();
-      if (msg.chatId === currentChatId) {
-        currentConfig = null; updatePanel();
-        if (scanTimer) { clearInterval(scanTimer); scanTimer = null; }
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    (async () => {
+      switch (msg.type) {
+        case 'VKE_GET_STATE':
+          sendResponse({ chatId: currentChatId, config: currentChatState, onPage: location.href.includes('vk.com/im') });
+          break;
+        case 'VKE_HS_START':   await doStartHandshake();      break;
+        case 'VKE_HS_CANCEL':
+        case 'VKE_HS_DECLINE': await doCancelHandshake();     break;
+        case 'VKE_HS_ACCEPT':  await doAcceptHandshake();     break;
+        case 'VKE_FP_CONFIRM': await doConfirmFingerprint();  break;
+        case 'VKE_TOGGLE':     await doToggle();               break;
+        case 'VKE_RESET_CHAT':
+          if (!msg.chatId || msg.chatId === currentChatId) await doReset();
+          break;
       }
-    }
-    if (msg.type === 'VKE_SET_PASSPHRASE' && msg.chatId && msg.passphrase) {
-      const cfg = allChats[msg.chatId] || defaultConfig();
-      cfg.passphrase = msg.passphrase; cfg.enabled = true; cfg.handshake.state = 'active';
-      setConfig(msg.chatId, cfg);
-      if (msg.chatId === currentChatId) {
-        currentConfig = cfg; updatePanel(); scheduleScan(); scheduleDecrypt();
-      }
-    }
+    })();
+    return true;
   });
 
+  // Keep in-memory state in sync when storage changes (e.g. from popup)
   chrome.storage.onChanged.addListener(changes => {
-    if (changes.vkEncChats) {
-      allChats = changes.vkEncChats.newValue || {};
-      currentConfig = getConfig(currentChatId);
-      updatePanel(); scheduleScan();
-    }
+    if (!changes[STORAGE_KEY] || !currentChatId) return;
+    const fresh = (changes[STORAGE_KEY].newValue || {})[currentChatId];
+    if (fresh) { currentChatState = { ...EMPTY_CFG(), ...fresh }; updatePanel(); }
   });
+
+  // ── Toast notification ────────────────────────────────────────────────────
+
+  function showToast(text) {
+    let el = document.getElementById('vke-toast');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'vke-toast';
+      el.className = 'vke-toast';
+      document.body.appendChild(el);
+    }
+    el.textContent = text;
+    el.classList.add('vke-toast--show');
+    clearTimeout(el._t);
+    el._t = setTimeout(() => el.classList.remove('vke-toast--show'), 2500);
+  }
 
   // ── Init ──────────────────────────────────────────────────────────────────
 
-  function init() {
-    watchNavigation();
+  async function init() {
     setupSendInterceptor();
     setupMutationObserver();
-    onUrlChange();
+    startURLWatcher();
+    await onChatChange();
+    setInterval(ensurePanel, 4000);
+    setInterval(() => {
+      if (currentChatState?.passphrase) decryptAllMessages();
+      scanForHandshakeMessages();
+    }, 5000);
   }
 
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
-  else init();
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
 
 })();
