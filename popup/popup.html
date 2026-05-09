@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="ru">
 <head>
   <meta charset="UTF-8">
@@ -7,42 +7,109 @@
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
-  <div class="popup-container">
-    <div class="popup-header">
-      <div class="logo">🔒</div>
-      <h1>VK Шифратор</h1>
+  <!-- Header -->
+  <div class="p-header">
+    <svg class="p-logo" viewBox="0 0 24 24" fill="none">
+      <rect x="3" y="11" width="18" height="11" rx="2" fill="currentColor" opacity="0.15"/>
+      <rect x="3" y="11" width="18" height="11" rx="2" stroke="currentColor" stroke-width="1.5"/>
+      <path d="M8 11V7a4 4 0 0 1 8 0v4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+      <circle cx="12" cy="16" r="1.5" fill="currentColor"/>
+    </svg>
+    <span class="p-title">VK Шифратор</span>
+    <span class="p-version">v2.0</span>
+  </div>
+
+  <!-- Current chat block -->
+  <div class="p-section" id="sect-chat">
+    <div class="p-label">Текущий чат</div>
+
+    <!-- No IM page -->
+    <div id="state-nopage" class="p-card p-card--muted hidden">
+      <span class="p-muted">Откройте переписку на vk.com/im</span>
     </div>
 
-    <div class="status-bar" id="statusBar">
-      <span class="status-dot" id="statusDot"></span>
-      <span id="statusText">Не активно</span>
+    <!-- No chat selected -->
+    <div id="state-nochat" class="p-card p-card--muted hidden">
+      <span class="p-muted">Выберите диалог в мессенджере</span>
     </div>
 
-    <div class="section">
-      <label for="encryptionKey">Ключ шифрования</label>
-      <div class="key-input-group">
-        <input type="password" id="encryptionKey" placeholder="Введите общий ключ..." autocomplete="off">
-        <button id="toggleKeyVisibility" class="icon-btn" title="Показать/скрыть ключ">👁</button>
+    <!-- Chat: no key / handshake none -->
+    <div id="state-none" class="p-card hidden">
+      <div class="p-card-row">
+        <span class="p-status-dot p-status-dot--off"></span>
+        <span class="p-card-title">Шифрование не настроено</span>
       </div>
-      <p class="hint">Одинаковый ключ должен быть у обоих собеседников</p>
+      <div class="p-card-hint">Нажмите «Рукопожатие», чтобы установить ключ с собеседником</div>
+      <div class="p-card-row p-card-row--btns">
+        <button class="p-btn p-btn--blue" id="btn-hs-start">🤝 Рукопожатие</button>
+      </div>
     </div>
 
-    <div class="section">
-      <label class="toggle-label">
-        <span>Шифрование активно</span>
-        <input type="checkbox" id="encryptionEnabled">
-        <span class="toggle-slider"></span>
-      </label>
+    <!-- Chat: handshake initiated -->
+    <div id="state-initiated" class="p-card hidden">
+      <div class="p-card-row">
+        <span class="p-status-dot p-status-dot--wait"></span>
+        <span class="p-card-title">Ожидание ответа…</span>
+      </div>
+      <div class="p-card-hint">Собеседник должен принять запрос в своём интерфейсе</div>
+      <div class="p-card-row p-card-row--btns">
+        <button class="p-btn p-btn--ghost" id="btn-hs-cancel">Отменить</button>
+      </div>
     </div>
 
-    <div class="section">
-      <button id="saveBtn" class="primary-btn">Сохранить</button>
+    <!-- Chat: handshake received -->
+    <div id="state-received" class="p-card hidden">
+      <div class="p-card-row">
+        <span class="p-status-dot p-status-dot--wait"></span>
+        <span class="p-card-title">Входящий запрос шифрования</span>
+      </div>
+      <div class="p-card-hint">Собеседник хочет установить зашифрованный канал</div>
+      <div class="p-card-row p-card-row--btns">
+        <button class="p-btn p-btn--blue"  id="btn-hs-accept">✓ Принять</button>
+        <button class="p-btn p-btn--ghost" id="btn-hs-decline">Отклонить</button>
+      </div>
     </div>
 
-    <div class="section info">
-      <p>📌 Зашифрованные сообщения помечаются префиксом <code>🔐ENC:</code></p>
-      <p>📌 Без расширения сообщения выглядят как случайный набор символов</p>
+    <!-- Chat: verifying fingerprint -->
+    <div id="state-verifying" class="p-card hidden">
+      <div class="p-card-row">
+        <span class="p-status-dot p-status-dot--wait"></span>
+        <span class="p-card-title">Сверьте эмодзи</span>
+      </div>
+      <div class="p-card-hint">Позвоните или напишите собеседнику вне ВКонтакте и сверьте эмодзи — они должны совпасть у обоих:</div>
+      <div class="p-fp" id="fp-display"></div>
+      <div class="p-card-row p-card-row--btns">
+        <button class="p-btn p-btn--green"  id="btn-fp-ok">✓ Совпадают</button>
+        <button class="p-btn p-btn--red"    id="btn-fp-bad">✕ Не совпадают</button>
+      </div>
     </div>
+
+    <!-- Chat: active -->
+    <div id="state-active" class="p-card hidden">
+      <div class="p-card-row">
+        <span class="p-status-dot" id="active-dot"></span>
+        <span class="p-card-title" id="active-title"></span>
+        <label class="p-toggle">
+          <input type="checkbox" id="chk-enabled">
+          <span class="p-toggle-track"></span>
+        </label>
+      </div>
+      <div class="p-card-hint">Safety Numbers — сверьте с собеседником:</div>
+      <div class="p-fp p-fp--sm" id="fp-active"></div>
+      <div class="p-card-row p-card-row--btns">
+        <button class="p-btn p-btn--ghost p-btn--sm" id="btn-reset">↺ Сбросить ключ</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Divider -->
+  <div class="p-divider"></div>
+
+  <!-- All configured chats -->
+  <div class="p-section" id="sect-chats">
+    <div class="p-label">Настроенные чаты</div>
+    <div id="chats-list"></div>
+    <div id="chats-empty" class="p-muted hidden">Нет настроенных чатов</div>
   </div>
 
   <script src="popup.js"></script>

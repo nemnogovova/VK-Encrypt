@@ -1,11 +1,12 @@
 {
   "manifest_version": 3,
   "name": "VK Шифратор",
-  "version": "1.0.0",
-  "description": "Сквозное шифрование сообщений в ВКонтакте",
+  "version": "2.0.0",
+  "description": "Сквозное шифрование сообщений с ECDH-рукопожатием и ключами по чатам",
   "permissions": [
     "storage",
-    "activeTab"
+    "activeTab",
+    "tabs"
   ],
   "host_permissions": [
     "https://vk.com/*",

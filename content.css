@@ -1,72 +1,149 @@
-/* VK Шифратор — Content Script Styles */
+﻿/* VK Шифратор — Content Styles */
+/* Uses VK's own CSS variables where available for native look */
 
-/* Status indicator */
-#vk-enc-indicator {
-  position: fixed;
-  bottom: 16px;
-  left: 16px;
-  z-index: 10000;
-  width: 36px;
-  height: 36px;
-  border-radius: 50%;
+/* ── Panel ──────────────────────────────────────────────────────────────── */
+#vke-panel {
+  font-family: -apple-system, BlinkMacSystemFont, "Roboto", "Helvetica Neue", Arial, sans-serif;
+  font-size: 13px;
+  line-height: 1.3;
+  background: var(--vkui--color_background_content, #fff);
+  border-bottom: 1px solid var(--vkui--color_separator_primary, #dce1e6);
+  padding: 0 16px;
+  z-index: 115;
+  box-sizing: border-box;
+  width: 100%;
+  transition: background 0.2s;
+}
+
+.vke-panel--on  { border-left: 3px solid #4bb34b; }
+.vke-panel--off { border-left: 3px solid #99a2ad; }
+
+/* Row / Col layout */
+.vke-row {
   display: flex;
   align-items: center;
-  justify-content: center;
-  font-size: 18px;
+  gap: 8px;
+  min-height: 38px;
+  padding: 4px 0;
+}
+.vke-row--btns { gap: 6px; padding-bottom: 8px; }
+.vke-col { display: flex; flex-direction: column; padding: 6px 0; }
+
+/* Icons */
+.vke-ico      { font-size: 16px; flex-shrink: 0; }
+.vke-ico--on  { filter: drop-shadow(0 0 2px rgba(75,179,75,0.5)); }
+.vke-ico--off { opacity: 0.55; }
+
+/* Status text */
+.vke-txt     { flex: 1; color: var(--vkui--color_text_primary, #000); }
+.vke-txt--on { color: #4bb34b; font-weight: 500; }
+
+/* Fingerprint (full) */
+.vke-fp {
+  font-size: 22px;
+  letter-spacing: 4px;
+  text-align: center;
+  padding: 6px 0;
+  user-select: all;
   cursor: default;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
-  transition: background 0.3s, transform 0.15s;
-  user-select: none;
 }
 
-#vk-enc-indicator.active {
-  background: #e6f5e6;
-  border: 2px solid #4bb34b;
+/* Fingerprint (mini inline) */
+.vke-fp-sm {
+  font-size: 14px;
+  letter-spacing: 2px;
+  cursor: default;
+  flex-shrink: 0;
+  opacity: 0.8;
 }
+.vke-fp-sm:hover { opacity: 1; }
 
-#vk-enc-indicator.inactive {
-  background: #f5e6e6;
-  border: 2px solid #e64646;
-  opacity: 0.7;
+/* Buttons */
+.vke-btn {
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12.5px;
+  font-family: inherit;
+  padding: 5px 12px;
+  line-height: 1.4;
+  transition: background 0.15s, opacity 0.15s;
+  white-space: nowrap;
 }
+.vke-btn:active { opacity: 0.8; }
 
-#vk-enc-indicator:hover {
-  transform: scale(1.15);
+.vke-btn--blue  { background: #447bba; color: #fff; }
+.vke-btn--blue:hover { background: #3a6da8; }
+
+.vke-btn--green { background: #4bb34b; color: #fff; }
+.vke-btn--green:hover { background: #42a042; }
+
+.vke-btn--red   { background: #e64646; color: #fff; }
+.vke-btn--red:hover { background: #d03c3c; }
+
+.vke-btn--ghost {
+  background: var(--vkui--color_background_secondary, #f0f2f5);
+  color: var(--vkui--color_text_primary, #000);
+  border: 1px solid var(--vkui--color_separator_primary, #dce1e6);
 }
+.vke-btn--ghost:hover { background: var(--vkui--color_separator_secondary, #e7e8ec); }
 
-/* Decrypted message wrapper */
-.vk-enc-decrypted-wrap {
+.vke-btn--sm { padding: 5px 8px; }
+
+/* ── Handshake message pill ──────────────────────────────────────────────── */
+.vke-hs-msg {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: var(--vkui--color_background_secondary, #f0f2f5);
+  border-radius: 10px;
+  padding: 3px 10px;
+  font-size: 12px;
+  color: var(--vkui--color_icon_medium, #6f7985);
+}
+.vke-hs-ico { font-size: 14px; }
+.vke-hs-lbl { font-style: italic; }
+
+/* ── Decrypted message ───────────────────────────────────────────────────── */
+.vke-dec {
   display: inline;
-  position: relative;
-  border-left: 3px solid #4bb34b;
-  padding-left: 5px;
+  border-left: 2px solid #4bb34b;
+  padding-left: 4px;
   margin-left: 1px;
 }
 
-.vk-enc-text {
+.vke-badge {
   display: inline;
-}
-
-/* Locked (can't decrypt) wrapper */
-.vk-enc-locked-wrap {
-  display: inline;
-  opacity: 0.8;
-}
-
-/* Badges */
-.vk-enc-badge {
-  display: inline;
-  margin-left: 3px;
+  margin-left: 4px;
   font-size: 11px;
-  vertical-align: middle;
-  cursor: help;
-  user-select: none;
+  cursor: default;
 }
+.vke-badge--ok     { }
+.vke-badge--locked { opacity: 0.6; }
 
-.vk-enc-badge--ok {
-  opacity: 0.85;
+.vke-locked { opacity: 0.75; }
+
+/* ── Toast ───────────────────────────────────────────────────────────────── */
+.vke-toast {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%) translateY(20px);
+  background: #333;
+  color: #fff;
+  padding: 10px 20px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-family: -apple-system, BlinkMacSystemFont, "Roboto", Arial, sans-serif;
+  z-index: 99999;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.3s, transform 0.3s;
+  max-width: 400px;
+  text-align: center;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.3);
 }
-
-.vk-enc-badge--locked {
-  opacity: 0.6;
+.vke-toast--show {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
 }
